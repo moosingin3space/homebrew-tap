@@ -1,0 +1,146 @@
+name: Build spotifyd-linux Bottles
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Formula/spotifyd-linux.rb'
+  workflow_dispatch:
+
+jobs:
+  get-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - name: Extract version from formula
+        id: version
+        run: |
+          VERSION=$(grep -oP 'url ".*refs/tags/v\K[0-9]+\.[0-9]+\.[0-9]+' Formula/spotifyd-linux.rb)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+  build-linux-bottle:
+    needs: get-version
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - name: Set up Homebrew and build bottle
+        run: |
+          VERSION="${{ needs.get-version.outputs.version }}"
+          mkdir -p /tmp/homebrew-tap
+          cp -r . /tmp/homebrew-tap/
+          docker run --rm \
+            -v "/tmp/homebrew-tap:/tmp/homebrew-tap" \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            homebrew/ubuntu24.04:latest \
+            bash -c "
+          brew update-reset
+          mkdir -p /home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/moosingin3space
+          cp -r /tmp/homebrew-tap /home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/moosingin3space/homebrew-tap
+          brew install --build-bottle 'moosingin3space/tap/spotifyd-linux'
+          cd /tmp
+          brew bottle --json --root-url='https://github.com/${{ github.repository }}/releases/download/spotifyd-linux-${VERSION}' 'moosingin3space/tap/spotifyd-linux'
+          sudo chown -R \$(whoami) /workspace
+          cp *.bottle.* /workspace/
+          "
+      - name: Rename bottle files
+        run: |
+          sudo chown -R "$(whoami)" .
+          for file in *.bottle.*; do
+            if [[ -f "$file" ]]; then
+              newname="${file/--/-}"
+              if [[ "$file" != "$newname" ]]; then
+                mv "$file" "$newname"
+              fi
+            fi
+          done
+      - name: List bottle files
+        run: |
+          echo "Looking for bottle files..."
+          ls -la ./*.bottle.* || echo "No bottle files found in current directory"
+      - name: Upload bottle artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: bottle-linux-${{ matrix.arch }}
+          path: '*.bottle.*'
+          if-no-files-found: error
+
+  upload-bottles:
+    needs: [get-version, build-linux-bottle]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - name: Download all bottles
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: bottle-*
+          merge-multiple: true
+          path: /tmp/bottles
+      - name: Check if release exists
+        id: check-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.get-version.outputs.version }}"
+          if gh release view "spotifyd-linux-$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release-exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release-exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create new release
+        if: steps.check-release.outputs.release-exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.get-version.outputs.version }}"
+          gh release create "spotifyd-linux-$VERSION" /tmp/bottles/*.bottle.* \
+            --title "spotifyd-linux $VERSION bottles" \
+            --notes "Bottles for spotifyd-linux $VERSION" \
+            --repo "$GITHUB_REPOSITORY"
+      - name: Update existing release
+        if: steps.check-release.outputs.release-exists == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.get-version.outputs.version }}"
+          gh release upload "spotifyd-linux-$VERSION" /tmp/bottles/*.bottle.* \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update formula with bottle SHAs
+        run: |
+          if [ -d /tmp/bottles ] && ls /tmp/bottles/*.bottle.json 1> /dev/null 2>&1; then
+            cd /tmp/bottles
+            brew bottle --merge --write --no-commit ./*.bottle.json
+            # Copy via temp file to handle symlink (setup-homebrew links tap to workspace)
+            cp "$(brew --repository)/Library/Taps/moosingin3space/homebrew-tap/Formula/spotifyd-linux.rb" /tmp/spotifyd-linux.rb
+            cp /tmp/spotifyd-linux.rb "${{ github.workspace }}/Formula/"
+          else
+            echo "No bottle files found, skipping merge"
+          fi
+      - name: Commit bottle updates
+        run: |
+          if git diff --quiet Formula/spotifyd-linux.rb; then
+            echo "No changes to formula"
+          else
+            git config --global user.email "action@github.com"
+            git config --global user.name "GitHub Action"
+            git add Formula/spotifyd-linux.rb
+            git commit -m "chore: add spotifyd-linux bottles for ${{ needs.get-version.outputs.version }}"
+            git push origin main
+          fi
