@@ -16,6 +16,12 @@ class GnomeFoundry < Formula
     strategy :gnome
   end
 
+  bottle do
+    root_url "https://github.com/moosingin3space/homebrew-tap/releases/download/gnome-foundry-1.1.1"
+    sha256 arm64_linux:  "1e112f21ecb757fb54f7da1325053264c190303acee9fc066825a9d4307aba2d"
+    sha256 x86_64_linux: "652ebb04e83b65ed86b0e4e6d25f00b8746bd79f115a851742b75ccdcda0d81d"
+  end
+
   depends_on "gettext" => :build
   depends_on "meson" => :build
   depends_on "ninja" => :build
